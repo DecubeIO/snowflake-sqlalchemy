@@ -10,5 +10,5 @@ PARAM_INTERNAL_APPLICATION_VERSION = "internal_application_version"
 
 APPLICATION_NAME = "SnowflakeSQLAlchemy"
 SNOWFLAKE_SQLALCHEMY_VERSION = pkg_resources.get_distribution(
-    "snowflake-sqlalchemy"
+    "snowflake-sqlalchemy-decube"
 ).version
