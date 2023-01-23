@@ -10,6 +10,7 @@ from sqlalchemy.engine import default
 from sqlalchemy.schema import Sequence, Table
 from sqlalchemy.sql import compiler, expression
 from sqlalchemy.sql.elements import quoted_name
+from sqlalchemy.util import text_type
 from sqlalchemy.util.compat import string_types
 
 from .custom_commands import AWSBucket, AzureContainer, ExternalStage
@@ -90,6 +91,16 @@ AUTOCOMMIT_REGEXP = re.compile(
 
 class SnowflakeIdentifierPreparer(compiler.IdentifierPreparer):
     reserved_words = {x.lower() for x in RESERVED_WORDS}
+
+    def _requires_quotes(self, value):
+        """Return True if the given identifier requires quoting."""
+        lc_value = value.lower()
+        return (
+            lc_value in self.reserved_words
+            or value[0] in self.illegal_initial_characters
+            or not self.legal_characters.match(text_type(value))
+            or not value.isupper()
+        )
 
     def __init__(self, dialect, **kw):
         quote = '"'
