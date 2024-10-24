@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2023 Snowflake Computing Inc. All rights reserved.
 #
 
 import sqlalchemy.types as sqltypes
@@ -59,6 +59,10 @@ class TIMESTAMP_NTZ(SnowflakeType):
 
 class GEOGRAPHY(SnowflakeType):
     __visit_name__ = "GEOGRAPHY"
+
+
+class GEOMETRY(SnowflakeType):
+    __visit_name__ = "GEOMETRY"
 
 
 class _CUSTOM_Date(SnowflakeType, sqltypes.Date):

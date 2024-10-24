@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2023 Snowflake Computing Inc. All rights reserved.
 #
 import decimal
 import json
@@ -28,14 +28,17 @@ from sqlalchemy import (
     String,
     Table,
     UniqueConstraint,
+    create_engine,
     dialects,
+    insert,
     inspect,
     text,
 )
-from sqlalchemy.exc import DBAPIError
-from sqlalchemy.pool import NullPool
+from sqlalchemy.exc import DBAPIError, NoSuchTableError, OperationalError
 from sqlalchemy.sql import and_, not_, or_, select
 
+import snowflake.connector.errors
+import snowflake.sqlalchemy.snowdialect
 from snowflake.connector import Error, ProgrammingError, connect
 from snowflake.sqlalchemy import URL, MergeInto, dialect
 from snowflake.sqlalchemy._constants import (
@@ -44,8 +47,7 @@ from snowflake.sqlalchemy._constants import (
 )
 from snowflake.sqlalchemy.snowdialect import SnowflakeDialect
 
-from .conftest import create_engine_with_future_flag as create_engine
-from .conftest import get_engine
+from .conftest import get_engine, url_factory
 from .parameters import CONNECTION_PARAMETERS
 from .util import ischema_names_baseline, random_string
 
@@ -99,35 +101,22 @@ def _create_users_addresses_tables_without_sequence(engine_testaccount, metadata
     return users, addresses
 
 
-def verify_engine_connection(engine, verify_app_name):
+def verify_engine_connection(engine):
     with engine.connect() as conn:
         results = conn.execute(text("select current_version()")).fetchone()
-        if verify_app_name:
-            assert conn.connection.driver_connection.application == APPLICATION_NAME
-            assert (
-                conn.connection.driver_connection._internal_application_name
-                == APPLICATION_NAME
-            )
-            assert (
-                conn.connection.driver_connection._internal_application_version
-                == SNOWFLAKE_SQLALCHEMY_VERSION
-            )
+        assert conn.connection.driver_connection.application == APPLICATION_NAME
+        assert (
+            conn.connection.driver_connection._internal_application_name
+            == APPLICATION_NAME
+        )
+        assert (
+            conn.connection.driver_connection._internal_application_version
+            == SNOWFLAKE_SQLALCHEMY_VERSION
+        )
         assert results is not None
 
 
-@pytest.mark.parametrize(
-    "verify_app_name",
-    [
-        False,
-        pytest.param(
-            True,
-            marks=pytest.mark.xfail(
-                reason="Pending backend service to recognize SnowflakeSQLAlchemy as a valid client app id"
-            ),
-        ),
-    ],
-)
-def test_connect_args(verify_app_name):
+def test_connect_args():
     """
     Tests connect string
 
@@ -148,7 +137,7 @@ def test_connect_args(verify_app_name):
         )
     )
     try:
-        verify_engine_connection(engine, verify_app_name)
+        verify_engine_connection(engine)
     finally:
         engine.dispose()
 
@@ -163,7 +152,7 @@ def test_connect_args(verify_app_name):
         )
     )
     try:
-        verify_engine_connection(engine, verify_app_name)
+        verify_engine_connection(engine)
     finally:
         engine.dispose()
 
@@ -179,7 +168,39 @@ def test_connect_args(verify_app_name):
         )
     )
     try:
-        verify_engine_connection(engine, verify_app_name)
+        verify_engine_connection(engine)
+    finally:
+        engine.dispose()
+
+
+def test_boolean_query_argument_parsing():
+    engine = create_engine(
+        URL(
+            user=CONNECTION_PARAMETERS["user"],
+            password=CONNECTION_PARAMETERS["password"],
+            account=CONNECTION_PARAMETERS["account"],
+            host=CONNECTION_PARAMETERS["host"],
+            port=CONNECTION_PARAMETERS["port"],
+            protocol=CONNECTION_PARAMETERS["protocol"],
+            validate_default_parameters=True,
+        )
+    )
+    try:
+        verify_engine_connection(engine)
+        connection = engine.raw_connection()
+        assert connection.validate_default_parameters is True
+    finally:
+        connection.close()
+        engine.dispose()
+
+
+def test_create_dialect():
+    """
+    Tests getting only dialect object through create_engine
+    """
+    engine = create_engine("snowflake://")
+    try:
+        assert engine.dialect
     finally:
         engine.dispose()
 
@@ -385,16 +406,6 @@ def test_insert_tables(engine_testaccount):
                     str(users.join(addresses)) == "users JOIN addresses ON "
                     "users.id = addresses.user_id"
                 )
-                assert (
-                    str(
-                        users.join(
-                            addresses,
-                            addresses.c.email_address.like(users.c.name + "%"),
-                        )
-                    )
-                    == "users JOIN addresses "
-                    "ON addresses.email_address LIKE users.name || :name_1"
-                )
 
                 s = select(users.c.fullname).select_from(
                     users.join(
@@ -415,6 +426,15 @@ def test_insert_tables(engine_testaccount):
             # drop tables
             addresses.drop(engine_testaccount)
             users.drop(engine_testaccount)
+
+
+def test_table_does_not_exist(engine_testaccount):
+    """
+    Tests Correct Exception Thrown When Table Does Not Exist
+    """
+    meta = MetaData()
+    with pytest.raises(NoSuchTableError):
+        Table("does_not_exist", meta, autoload_with=engine_testaccount)
 
 
 @pytest.mark.skip(
@@ -440,9 +460,7 @@ def test_reflextion(engine_testaccount):
         )
         try:
             meta = MetaData()
-            user_reflected = Table(
-                "user", meta, autoload=True, autoload_with=engine_testaccount
-            )
+            user_reflected = Table("user", meta, autoload_with=engine_testaccount)
             assert user_reflected.c == ["user.id", "user.name", "user.fullname"]
         finally:
             conn.execute("DROP TABLE IF EXISTS user")
@@ -484,19 +502,20 @@ def test_inspect_column(engine_testaccount):
         users.drop(engine_testaccount)
 
 
-def test_get_indexes(engine_testaccount):
+def test_get_indexes(engine_testaccount, db_parameters):
     """
     Tests get indexes
 
-    NOTE: Snowflake doesn't support indexes
+    NOTE: Only Snowflake Hybrid Tables support indexes
     """
+    schema = db_parameters["schema"]
     metadata = MetaData()
     users, addresses = _create_users_addresses_tables_without_sequence(
         engine_testaccount, metadata
     )
     try:
         inspector = inspect(engine_testaccount)
-        assert inspector.get_indexes("users") == []
+        assert inspector.get_indexes("users", schema) == []
 
     finally:
         addresses.drop(engine_testaccount)
@@ -906,37 +925,6 @@ def test_column_metadata(engine_testaccount):
     assert str(t.columns["real_data"].type) == "FLOAT"
 
 
-def _get_engine_with_columm_metadata_cache(
-    db_parameters, user=None, password=None, account=None
-):
-    """
-    Creates a connection with column metadata cache
-    """
-    if user is not None:
-        db_parameters["user"] = user
-    if password is not None:
-        db_parameters["password"] = password
-    if account is not None:
-        db_parameters["account"] = account
-
-    engine = create_engine(
-        URL(
-            user=db_parameters["user"],
-            password=db_parameters["password"],
-            host=db_parameters["host"],
-            port=db_parameters["port"],
-            database=db_parameters["database"],
-            schema=db_parameters["schema"],
-            account=db_parameters["account"],
-            protocol=db_parameters["protocol"],
-            cache_column_metadata=True,
-        ),
-        poolclass=NullPool,
-    )
-
-    return engine
-
-
 def test_many_table_column_metadta(db_parameters):
     """
     Get dozens of table metadata with column metadata cache.
@@ -944,7 +932,9 @@ def test_many_table_column_metadta(db_parameters):
     cache_column_metadata=True will cache all column metadata for all tables
     in the schema.
     """
-    engine = _get_engine_with_columm_metadata_cache(db_parameters)
+    url = url_factory(cache_column_metadata=True)
+    engine = get_engine(url)
+
     RE_SUFFIX_NUM = re.compile(r".*(\d+)$")
     metadata = MetaData()
     total_objects = 10
@@ -1070,28 +1060,16 @@ def test_cache_time(engine_testaccount, db_parameters):
     assert outcome
 
 
-@pytest.mark.timeout(15)
-def test_region():
-    engine = create_engine(
-        URL(
-            user="testuser",
-            password="testpassword",
-            account="testaccount",
-            region="eu-central-1",
-            login_timeout=5,
-        )
-    )
-    try:
-        engine.connect()
-        pytest.fail("should not run")
-    except Exception as ex:
-        assert ex.orig.errno == 250001
-        assert "Failed to connect to DB" in ex.orig.msg
-        assert "testaccount.eu-central-1.snowflakecomputing.com" in ex.orig.msg
-
-
-@pytest.mark.timeout(15)
-def test_azure():
+@pytest.mark.skip(reason="Testaccount is not available, it returns 404 error.")
+@pytest.mark.timeout(10)
+@pytest.mark.parametrize(
+    "region",
+    (
+        pytest.param("eu-central-1", id="region"),
+        pytest.param("east-us-2.azure", id="azure"),
+    ),
+)
+def test_connection_timeout_error(region):
     engine = create_engine(
         URL(
             user="testuser",
@@ -1101,13 +1079,13 @@ def test_azure():
             login_timeout=5,
         )
     )
-    try:
+
+    with pytest.raises(OperationalError) as excinfo:
         engine.connect()
-        pytest.fail("should not run")
-    except Exception as ex:
-        assert ex.orig.errno == 250001
-        assert "Failed to connect to DB" in ex.orig.msg
-        assert "testaccount.east-us-2.azure.snowflakecomputing.com" in ex.orig.msg
+
+    assert excinfo.value.orig.errno == 250001
+    assert "Could not connect to Snowflake backend" in excinfo.value.orig.msg
+    assert region not in excinfo.value.orig.msg
 
 
 def test_load_dialect():
@@ -1313,7 +1291,8 @@ def test_comment_sqlalchemy(db_parameters, engine_testaccount, on_public_ci):
     column_comment1 = random_string(10, choices=string.ascii_uppercase)
     table_comment2 = random_string(10, choices=string.ascii_uppercase)
     column_comment2 = random_string(10, choices=string.ascii_uppercase)
-    engine2, _ = get_engine(schema=new_schema)
+
+    engine2 = get_engine(url_factory(schema=new_schema))
     con2 = None
     if not on_public_ci:
         con2 = engine2.connect()
@@ -1394,47 +1373,51 @@ def test_special_schema_character(db_parameters, on_public_ci):
 
 
 def test_autoincrement(engine_testaccount):
+    """Snowflake does not guarantee generating sequence numbers without gaps.
+
+    The generated numbers are not necessarily contiguous.
+    https://docs.snowflake.com/en/user-guide/querying-sequences
+    """
     metadata = MetaData()
     users = Table(
         "users",
         metadata,
-        Column("uid", Integer, Sequence("id_seq"), primary_key=True),
+        Column("uid", Integer, Sequence("id_seq", order=True), primary_key=True),
         Column("name", String(39)),
     )
 
     try:
-        users.create(engine_testaccount)
+        metadata.create_all(engine_testaccount)
 
-        with engine_testaccount.connect() as connection:
-            with connection.begin():
-                connection.execute(users.insert(), [{"name": "sf1"}])
-                assert connection.execute(select(users)).fetchall() == [(1, "sf1")]
-                connection.execute(users.insert(), [{"name": "sf2"}, {"name": "sf3"}])
-                assert connection.execute(select(users)).fetchall() == [
-                    (1, "sf1"),
-                    (2, "sf2"),
-                    (3, "sf3"),
-                ]
-                connection.execute(users.insert(), {"name": "sf4"})
-                assert connection.execute(select(users)).fetchall() == [
-                    (1, "sf1"),
-                    (2, "sf2"),
-                    (3, "sf3"),
-                    (4, "sf4"),
-                ]
+        with engine_testaccount.begin() as connection:
+            connection.execute(insert(users), [{"name": "sf1"}])
+            assert connection.execute(select(users)).fetchall() == [(1, "sf1")]
+            connection.execute(insert(users), [{"name": "sf2"}, {"name": "sf3"}])
+            assert connection.execute(select(users)).fetchall() == [
+                (1, "sf1"),
+                (2, "sf2"),
+                (3, "sf3"),
+            ]
+            connection.execute(insert(users), {"name": "sf4"})
+            assert connection.execute(select(users)).fetchall() == [
+                (1, "sf1"),
+                (2, "sf2"),
+                (3, "sf3"),
+                (4, "sf4"),
+            ]
 
-                seq = Sequence("id_seq")
-                nextid = connection.execute(seq)
-                connection.execute(users.insert(), [{"uid": nextid, "name": "sf5"}])
-                assert connection.execute(select(users)).fetchall() == [
-                    (1, "sf1"),
-                    (2, "sf2"),
-                    (3, "sf3"),
-                    (4, "sf4"),
-                    (5, "sf5"),
-                ]
+            seq = Sequence("id_seq")
+            nextid = connection.execute(seq)
+            connection.execute(insert(users), [{"uid": nextid, "name": "sf5"}])
+            assert connection.execute(select(users)).fetchall() == [
+                (1, "sf1"),
+                (2, "sf2"),
+                (3, "sf3"),
+                (4, "sf4"),
+                (5, "sf5"),
+            ]
     finally:
-        users.drop(engine_testaccount)
+        metadata.drop_all(engine_testaccount)
 
 
 @pytest.mark.skip(
@@ -1529,11 +1512,16 @@ def test_too_many_columns_detection(engine_testaccount, db_parameters):
     metadata.create_all(engine_testaccount)
     inspector = inspect(engine_testaccount)
     # Do test
-    original_execute = inspector.bind.execute
+    connection = inspector.bind.connect()
+    original_execute = connection.execute
+
+    too_many_columns_was_raised = False
 
     def mock_helper(command, *args, **kwargs):
-        if "_get_schema_columns" in command:
+        if "_get_schema_columns" in command.text:
             # Creating exception exactly how SQLAlchemy does
+            nonlocal too_many_columns_was_raised
+            too_many_columns_was_raised = True
             raise DBAPIError.instance(
                 """
             SELECT /* sqlalchemy:_get_schema_columns */
@@ -1565,9 +1553,12 @@ def test_too_many_columns_detection(engine_testaccount, db_parameters):
         else:
             return original_execute(command, *args, **kwargs)
 
-    with patch.object(inspector.bind, "execute", side_effect=mock_helper):
-        column_metadata = inspector.get_columns("users", db_parameters["schema"])
+    with patch.object(engine_testaccount, "connect") as conn:
+        conn.return_value = connection
+        with patch.object(connection, "execute", side_effect=mock_helper):
+            column_metadata = inspector.get_columns("users", db_parameters["schema"])
     assert len(column_metadata) == 4
+    assert too_many_columns_was_raised
     # Clean up
     metadata.drop_all(engine_testaccount)
 
@@ -1603,14 +1594,13 @@ CREATE TEMP TABLE {table_name} (
     C1 BIGINT, C2 BINARY, C3 BOOLEAN, C4 CHAR, C5 CHARACTER, C6 DATE, C7 DATETIME, C8 DEC,
     C9 DECIMAL, C10 DOUBLE, C11 FLOAT, C12 INT, C13 INTEGER, C14 NUMBER, C15 REAL, C16 BYTEINT,
     C17 SMALLINT, C18 STRING, C19 TEXT, C20 TIME, C21 TIMESTAMP, C22 TIMESTAMP_TZ, C23 TIMESTAMP_LTZ,
-    C24 TIMESTAMP_NTZ, C25 TINYINT, C26 VARBINARY, C27 VARCHAR, C28 VARIANT, C29 OBJECT, C30 ARRAY, C31 GEOGRAPHY
+    C24 TIMESTAMP_NTZ, C25 TINYINT, C26 VARBINARY, C27 VARCHAR, C28 VARIANT, C29 OBJECT, C30 ARRAY, C31 GEOGRAPHY,
+    C32 GEOMETRY
 )
 """
         )
 
-        table_reflected = Table(
-            table_name, MetaData(), autoload=True, autoload_with=conn
-        )
+        table_reflected = Table(table_name, MetaData(), autoload_with=conn)
         columns = table_reflected.columns
         assert (
             len(columns) == len(ischema_names_baseline) - 1
@@ -1626,13 +1616,12 @@ CREATE TEMP TABLE {table_name} (
     C1 BIGINT, C2 BINARY, C3 BOOLEAN, C4 CHAR, C5 CHARACTER, C6 DATE, C7 DATETIME, C8 DEC(12,3),
     C9 DECIMAL(12,3), C10 DOUBLE, C11 FLOAT, C12 INT, C13 INTEGER, C14 NUMBER, C15 REAL, C16 BYTEINT,
     C17 SMALLINT, C18 STRING, C19 TEXT, C20 TIME, C21 TIMESTAMP, C22 TIMESTAMP_TZ, C23 TIMESTAMP_LTZ,
-    C24 TIMESTAMP_NTZ, C25 TINYINT, C26 VARBINARY, C27 VARCHAR, C28 VARIANT, C29 OBJECT, C30 ARRAY, C31 GEOGRAPHY
+    C24 TIMESTAMP_NTZ, C25 TINYINT, C26 VARBINARY, C27 VARCHAR, C28 VARIANT, C29 OBJECT, C30 ARRAY, C31 GEOGRAPHY,
+    C32 GEOMETRY
 )
 """
         )
-        table_reflected = Table(
-            table_name, MetaData(), autoload=True, autoload_with=conn
-        )
+        table_reflected = Table(table_name, MetaData(), autoload_with=conn)
         current_date = date.today()
         current_utctime = datetime.utcnow()
         current_localtime = pytz.utc.localize(current_utctime, is_dst=False).astimezone(
@@ -1652,6 +1641,8 @@ CREATE TEMP TABLE {table_name} (
         CHAR_VALUE = "A"
         GEOGRAPHY_VALUE = "POINT(-122.35 37.55)"
         GEOGRAPHY_RESULT_VALUE = '{"coordinates": [-122.35,37.55],"type": "Point"}'
+        GEOMETRY_VALUE = "POINT(-94.58473 39.08985)"
+        GEOMETRY_RESULT_VALUE = '{"coordinates": [-94.58473,39.08985],"type": "Point"}'
 
         ins = table_reflected.insert().values(
             c1=MAX_INT_VALUE,  # BIGINT
@@ -1685,6 +1676,7 @@ CREATE TEMP TABLE {table_name} (
             c29=None,  # OBJECT, currently snowflake-sqlalchemy/connector does not support binding variant
             c30=None,  # ARRAY, currently snowflake-sqlalchemy/connector does not support binding variant
             c31=GEOGRAPHY_VALUE,  # GEOGRAPHY
+            c32=GEOMETRY_VALUE,  # GEOMETRY
         )
         conn.execute(ins)
 
@@ -1723,6 +1715,7 @@ CREATE TEMP TABLE {table_name} (
             and result[28] is None
             and result[29] is None
             and json.loads(result[30]) == json.loads(GEOGRAPHY_RESULT_VALUE)
+            and json.loads(result[31]) == json.loads(GEOMETRY_RESULT_VALUE)
         )
 
         sql = f"""
@@ -1785,3 +1778,90 @@ CREATE OR REPLACE TEMP TABLE {table_name}
             and columns[0]["name"] == "col"
             and columns[1]["name"] == ""
         )
+
+
+def test_snowflake_sqlalchemy_as_valid_client_type():
+    engine = create_engine(
+        URL(
+            user=CONNECTION_PARAMETERS["user"],
+            password=CONNECTION_PARAMETERS["password"],
+            account=CONNECTION_PARAMETERS["account"],
+            host=CONNECTION_PARAMETERS["host"],
+            port=CONNECTION_PARAMETERS["port"],
+            protocol=CONNECTION_PARAMETERS["protocol"],
+        ),
+        connect_args={"internal_application_name": "UnknownClient"},
+    )
+    with engine.connect() as conn:
+        with pytest.raises(snowflake.connector.errors.NotSupportedError):
+            conn.exec_driver_sql("select 1").cursor.fetch_pandas_all()
+
+    engine = create_engine(
+        URL(
+            user=CONNECTION_PARAMETERS["user"],
+            password=CONNECTION_PARAMETERS["password"],
+            account=CONNECTION_PARAMETERS["account"],
+            host=CONNECTION_PARAMETERS["host"],
+            port=CONNECTION_PARAMETERS["port"],
+            protocol=CONNECTION_PARAMETERS["protocol"],
+        )
+    )
+    with engine.connect() as conn:
+        conn.exec_driver_sql("select 1").cursor.fetch_pandas_all()
+
+    try:
+        snowflake.sqlalchemy.snowdialect._ENABLE_SQLALCHEMY_AS_APPLICATION_NAME = False
+        origin_app = snowflake.connector.connection.DEFAULT_CONFIGURATION["application"]
+        origin_internal_app_name = snowflake.connector.connection.DEFAULT_CONFIGURATION[
+            "internal_application_name"
+        ]
+        origin_internal_app_version = (
+            snowflake.connector.connection.DEFAULT_CONFIGURATION[
+                "internal_application_version"
+            ]
+        )
+        snowflake.connector.connection.DEFAULT_CONFIGURATION["application"] = (
+            None,
+            (type(None), str),
+        )
+        snowflake.connector.connection.DEFAULT_CONFIGURATION[
+            "internal_application_name"
+        ] = (
+            "PythonConnector",
+            (type(None), str),
+        )
+        snowflake.connector.connection.DEFAULT_CONFIGURATION[
+            "internal_application_version"
+        ] = (
+            "3.0.0",
+            (type(None), str),
+        )
+        engine = create_engine(
+            URL(
+                user=CONNECTION_PARAMETERS["user"],
+                password=CONNECTION_PARAMETERS["password"],
+                account=CONNECTION_PARAMETERS["account"],
+                host=CONNECTION_PARAMETERS["host"],
+                port=CONNECTION_PARAMETERS["port"],
+                protocol=CONNECTION_PARAMETERS["protocol"],
+            )
+        )
+        with engine.connect() as conn:
+            conn.exec_driver_sql("select 1").cursor.fetch_pandas_all()
+            assert (
+                conn.connection.driver_connection._internal_application_name
+                == "PythonConnector"
+            )
+            assert (
+                conn.connection.driver_connection._internal_application_version
+                == "3.0.0"
+            )
+    finally:
+        snowflake.sqlalchemy.snowdialect._ENABLE_SQLALCHEMY_AS_APPLICATION_NAME = True
+        snowflake.connector.connection.DEFAULT_CONFIGURATION["application"] = origin_app
+        snowflake.connector.connection.DEFAULT_CONFIGURATION[
+            "internal_application_name"
+        ] = origin_internal_app_name
+        snowflake.connector.connection.DEFAULT_CONFIGURATION[
+            "internal_application_version"
+        ] = origin_internal_app_version

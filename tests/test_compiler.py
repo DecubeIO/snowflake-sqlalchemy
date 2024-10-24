@@ -1,11 +1,13 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2023 Snowflake Computing Inc. All rights reserved.
 #
 
-from sqlalchemy import Integer, String, and_, select
+from sqlalchemy import Integer, String, and_, func, select
 from sqlalchemy.schema import DropColumnComment, DropTableComment
 from sqlalchemy.sql import column, quoted_name, table
-from sqlalchemy.testing import AssertsCompiledSQL
+from sqlalchemy.testing.assertions import AssertsCompiledSQL
+
+from snowflake.sqlalchemy import snowdialect
 
 table1 = table(
     "table1", column("id", Integer), column("name", String), column("value", Integer)
@@ -22,6 +24,14 @@ table2 = table(
 
 class TestSnowflakeCompiler(AssertsCompiledSQL):
     __dialect__ = "snowflake"
+
+    def test_now_func(self):
+        statement = select(func.now())
+        self.assert_compile(
+            statement,
+            "SELECT CURRENT_TIMESTAMP AS now_1",
+            dialect="snowflake",
+        )
 
     def test_multi_table_delete(self):
         statement = table1.delete().where(table1.c.id == table2.c.id)
@@ -99,3 +109,14 @@ def test_quoted_name_label(engine_testaccount):
         sel_from_tbl = select(col).group_by(col).select_from(table("abc"))
         compiled_result = sel_from_tbl.compile()
         assert str(compiled_result) == t["output"]
+
+
+def test_outer_lateral_join():
+    col = column("colname").label("label")
+    col2 = column("colname2").label("label2")
+    lateral_table = func.flatten(func.PARSE_JSON(col2), outer=True).lateral()
+    stmt = select(col).select_from(table("abc")).join(lateral_table).group_by(col)
+    assert (
+        str(stmt.compile(dialect=snowdialect.dialect()))
+        == "SELECT colname AS label \nFROM abc JOIN LATERAL flatten(PARSE_JSON(colname2)) AS anon_1 GROUP BY colname"
+    )

@@ -1,21 +1,21 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2023 Snowflake Computing Inc. All rights reserved.
 #
 
 import operator
 from collections import defaultdict
 from functools import reduce
+from typing import Any
 from urllib.parse import unquote_plus
 
 import sqlalchemy.types as sqltypes
 from sqlalchemy import event as sa_vnt
 from sqlalchemy import exc as sa_exc
 from sqlalchemy import util as sa_util
-from sqlalchemy.engine import default, reflection
+from sqlalchemy.engine import URL, default, reflection
 from sqlalchemy.schema import Table
 from sqlalchemy.sql import text
 from sqlalchemy.sql.elements import quoted_name
-from sqlalchemy.sql.sqltypes import String
 from sqlalchemy.types import (
     BIGINT,
     BINARY,
@@ -38,8 +38,11 @@ from sqlalchemy.types import (
 )
 
 from snowflake.connector import errors as sf_errors
+from snowflake.connector.connection import DEFAULT_CONFIGURATION
 from snowflake.connector.constants import UTF8
+from snowflake.sqlalchemy.compat import returns_unicode
 
+from ._constants import DIALECT_NAME
 from .base import (
     SnowflakeCompiler,
     SnowflakeDDLCompiler,
@@ -51,6 +54,7 @@ from .custom_types import (
     _CUSTOM_DECIMAL,
     ARRAY,
     GEOGRAPHY,
+    GEOMETRY,
     OBJECT,
     TIMESTAMP_LTZ,
     TIMESTAMP_NTZ,
@@ -60,6 +64,12 @@ from .custom_types import (
     _CUSTOM_DateTime,
     _CUSTOM_Float,
     _CUSTOM_Time,
+)
+from .sql.custom_schema.custom_table_prefix import CustomTablePrefix
+from .util import (
+    _update_connection_application_name,
+    parse_url_boolean,
+    parse_url_integer,
 )
 
 colspecs = {
@@ -104,11 +114,14 @@ ischema_names = {
     "OBJECT": OBJECT,
     "ARRAY": ARRAY,
     "GEOGRAPHY": GEOGRAPHY,
+    "GEOMETRY": GEOMETRY,
 }
+
+_ENABLE_SQLALCHEMY_AS_APPLICATION_NAME = True
 
 
 class SnowflakeDialect(default.DefaultDialect):
-    name = "snowflake"
+    name = DIALECT_NAME
     driver = "snowflake"
     max_identifier_length = 255
     cte_follows_insert = True
@@ -128,7 +141,7 @@ class SnowflakeDialect(default.DefaultDialect):
     #  unicode strings
     supports_unicode_statements = True
     supports_unicode_binds = True
-    returns_unicode_strings = String.RETURNS_UNICODE
+    returns_unicode_strings = returns_unicode
     description_encoding = None
 
     # No lastrowid support. See SNOW-11155
@@ -189,11 +202,35 @@ class SnowflakeDialect(default.DefaultDialect):
 
     @classmethod
     def dbapi(cls):
+        return cls.import_dbapi()
+
+    @classmethod
+    def import_dbapi(cls):
         from snowflake import connector
 
         return connector
 
-    def create_connect_args(self, url):
+    @staticmethod
+    def parse_query_param_type(name: str, value: Any) -> Any:
+        """Cast param value if possible to type defined in connector-python."""
+        if not (maybe_type_configuration := DEFAULT_CONFIGURATION.get(name)):
+            return value
+
+        _, expected_type = maybe_type_configuration
+        if not isinstance(expected_type, tuple):
+            expected_type = (expected_type,)
+
+        if isinstance(value, expected_type):
+            return value
+
+        elif bool in expected_type:
+            return parse_url_boolean(value)
+        elif int in expected_type:
+            return parse_url_integer(value)
+        else:
+            return value
+
+    def create_connect_args(self, url: URL):
         opts = url.translate_connect_args(username="user")
         if "database" in opts:
             name_spaces = [unquote_plus(e) for e in opts["database"].split("/")]
@@ -206,7 +243,11 @@ class SnowflakeDialect(default.DefaultDialect):
                 raise sa_exc.ArgumentError(
                     f"Invalid name space is specified: {opts['database']}"
                 )
-        if ".snowflakecomputing.com" not in opts["host"] and not opts.get("port"):
+        if (
+            "host" in opts
+            and ".snowflakecomputing.com" not in opts["host"]
+            and not opts.get("port")
+        ):
             opts["account"] = opts["host"]
             if "." in opts["account"]:
                 # remove region subdomain
@@ -216,26 +257,34 @@ class SnowflakeDialect(default.DefaultDialect):
             opts["host"] = opts["host"] + ".snowflakecomputing.com"
             opts["port"] = "443"
         opts["autocommit"] = False  # autocommit is disabled by default
-        opts.update(url.query)
+
+        query = dict(**url.query)  # make mutable
+        cache_column_metadata = query.pop("cache_column_metadata", None)
         self._cache_column_metadata = (
-            opts.get("cache_column_metadata", "false").lower() == "true"
+            parse_url_boolean(cache_column_metadata) if cache_column_metadata else False
         )
+
+        # URL sets the query parameter values as strings, we need to cast to expected types when necessary
+        for name, value in query.items():
+            opts[name] = self.parse_query_param_type(name, value)
+
         return ([], opts)
 
-    def has_table(self, connection, table_name, schema=None):
+    @reflection.cache
+    def has_table(self, connection, table_name, schema=None, **kw):
         """
         Checks if the table exists
         """
         return self._has_object(connection, "TABLE", table_name, schema)
 
-    def has_sequence(self, connection, sequence_name, schema=None):
+    @reflection.cache
+    def has_sequence(self, connection, sequence_name, schema=None, **kw):
         """
         Checks if the sequence exists
         """
         return self._has_object(connection, "SEQUENCE", sequence_name, schema)
 
     def _has_object(self, connection, object_type, object_name, schema=None):
-
         full_name = self._denormalize_quote_join(schema, object_name)
         try:
             results = connection.execute(
@@ -303,14 +352,6 @@ class SnowflakeDialect(default.DefaultDialect):
         for idx, col in enumerate(result.cursor.description):
             name_to_idx[col[0]] = idx
         return name_to_idx
-
-    @reflection.cache
-    def get_indexes(self, connection, table_name, schema=None, **kw):
-        """
-        Gets all indexes
-        """
-        # no index is supported by Snowflake
-        return []
 
     @reflection.cache
     def get_check_constraints(self, connection, table_name, schema, **kw):
@@ -555,11 +596,13 @@ class SnowflakeDialect(default.DefaultDialect):
                     "autoincrement": is_identity == "YES",
                     "comment": comment,
                     "primary_key": (
-                        column_name
-                        in schema_primary_keys[table_name]["constrained_columns"]
-                    )
-                    if current_table_pks
-                    else False,
+                        (
+                            column_name
+                            in schema_primary_keys[table_name]["constrained_columns"]
+                        )
+                        if current_table_pks
+                        else False
+                    ),
                 }
             )
             if is_identity == "YES":
@@ -648,13 +691,19 @@ class SnowflakeDialect(default.DefaultDialect):
                     "autoincrement": is_identity == "YES",
                     "comment": comment if comment != "" else None,
                     "primary_key": (
-                        column_name
-                        in schema_primary_keys[table_name]["constrained_columns"]
-                    )
-                    if current_table_pks
-                    else False,
+                        (
+                            column_name
+                            in schema_primary_keys[table_name]["constrained_columns"]
+                        )
+                        if current_table_pks
+                        else False
+                    ),
                 }
             )
+
+        # If we didn't find any columns for the table, the table doesn't exist.
+        if len(ans) == 0:
+            raise sa_exc.NoSuchTableError()
         return ans
 
     def get_columns(self, connection, table_name, schema=None, **kw):
@@ -669,7 +718,10 @@ class SnowflakeDialect(default.DefaultDialect):
         if schema_columns is None:
             # Too many results, fall back to only query about single table
             return self._get_table_columns(connection, table_name, schema, **kw)
-        return schema_columns[self.normalize_name(table_name)]
+        normalized_table_name = self.normalize_name(table_name)
+        if normalized_table_name not in schema_columns:
+            raise sa_exc.NoSuchTableError()
+        return schema_columns[normalized_table_name]
 
     @reflection.cache
     def get_table_names(self, connection, schema=None, **kw):
@@ -829,16 +881,159 @@ class SnowflakeDialect(default.DefaultDialect):
             result = self._get_view_comment(connection, table_name, schema)
 
         return {
-            "text": result._mapping["comment"]
-            if result and result._mapping["comment"]
-            else None
+            "text": (
+                result._mapping["comment"]
+                if result and result._mapping["comment"]
+                else None
+            )
         }
+
+    def get_multi_indexes(
+        self,
+        connection,
+        *,
+        schema,
+        filter_names,
+        **kw,
+    ):
+        """
+        Gets the indexes definition
+        """
+
+        table_prefixes = self.get_multi_prefixes(
+            connection, schema, filter_prefix=CustomTablePrefix.HYBRID.name
+        )
+        if len(table_prefixes) == 0:
+            return []
+        schema = schema or self.default_schema_name
+        if not schema:
+            result = connection.execute(
+                text("SHOW /* sqlalchemy:get_multi_indexes */ INDEXES")
+            )
+        else:
+            result = connection.execute(
+                text(
+                    f"SHOW /* sqlalchemy:get_multi_indexes */ INDEXES IN SCHEMA {self._denormalize_quote_join(schema)}"
+                )
+            )
+
+        n2i = self.__class__._map_name_to_idx(result)
+        indexes = {}
+
+        for row in result.cursor.fetchall():
+            table = self.normalize_name(str(row[n2i["table"]]))
+            if (
+                row[n2i["name"]] == f'SYS_INDEX_{row[n2i["table"]]}_PRIMARY'
+                or table not in filter_names
+                or (schema, table) not in table_prefixes
+                or (
+                    (schema, table) in table_prefixes
+                    and CustomTablePrefix.HYBRID.name
+                    not in table_prefixes[(schema, table)]
+                )
+            ):
+                continue
+            index = {
+                "name": row[n2i["name"]],
+                "unique": row[n2i["is_unique"]] == "Y",
+                "column_names": row[n2i["columns"]],
+                "include_columns": row[n2i["included_columns"]],
+                "dialect_options": {},
+            }
+            if (schema, table) in indexes:
+                indexes[(schema, table)] = indexes[(schema, table)].append(index)
+            else:
+                indexes[(schema, table)] = [index]
+
+        return list(indexes.items())
+
+    def _value_or_default(self, data, table, schema):
+        table = self.normalize_name(str(table))
+        dic_data = dict(data)
+        if (schema, table) in dic_data:
+            return dic_data[(schema, table)]
+        else:
+            return []
+
+    def get_prefixes_from_data(self, n2i, row, **kw):
+        prefixes_found = []
+        for valid_prefix in CustomTablePrefix:
+            key = f"is_{valid_prefix.name.lower()}"
+            if key in n2i and row[n2i[key]] == "Y":
+                prefixes_found.append(valid_prefix.name)
+        return prefixes_found
+
+    @reflection.cache
+    def get_multi_prefixes(
+        self, connection, schema, table_name=None, filter_prefix=None, **kw
+    ):
+        """
+        Gets all table prefixes
+        """
+        schema = schema or self.default_schema_name
+        filter = f"LIKE '{table_name}'" if table_name else ""
+        if schema:
+            result = connection.execute(
+                text(
+                    f"SHOW /* sqlalchemy:get_multi_prefixes */ {filter} TABLES IN SCHEMA {schema}"
+                )
+            )
+        else:
+            result = connection.execute(
+                text(
+                    f"SHOW /* sqlalchemy:get_multi_prefixes */ {filter} TABLES LIKE '{table_name}'"
+                )
+            )
+
+        n2i = self.__class__._map_name_to_idx(result)
+        tables_prefixes = {}
+        for row in result.cursor.fetchall():
+            table = self.normalize_name(str(row[n2i["name"]]))
+            table_prefixes = self.get_prefixes_from_data(n2i, row)
+            if filter_prefix and filter_prefix not in table_prefixes:
+                continue
+            if (schema, table) in tables_prefixes:
+                tables_prefixes[(schema, table)].append(table_prefixes)
+            else:
+                tables_prefixes[(schema, table)] = table_prefixes
+
+        return tables_prefixes
+
+    @reflection.cache
+    def get_indexes(self, connection, tablename, schema, **kw):
+        """
+        Gets the indexes definition
+        """
+        table_name = self.normalize_name(str(tablename))
+        data = self.get_multi_indexes(
+            connection=connection, schema=schema, filter_names=[table_name], **kw
+        )
+
+        return self._value_or_default(data, table_name, schema)
+
+    def connect(self, *cargs, **cparams):
+        return (
+            super().connect(
+                *cargs,
+                **(
+                    _update_connection_application_name(**cparams)
+                    if _ENABLE_SQLALCHEMY_AS_APPLICATION_NAME
+                    else cparams
+                ),
+            )
+            if _ENABLE_SQLALCHEMY_AS_APPLICATION_NAME
+            else super().connect(*cargs, **cparams)
+        )
 
 
 @sa_vnt.listens_for(Table, "before_create")
 def check_table(table, connection, _ddl_runner, **kw):
+    from .sql.custom_schema.hybrid_table import HybridTable
+
+    if HybridTable.is_equal_type(table):  # noqa
+        return True
     if isinstance(_ddl_runner.dialect, SnowflakeDialect) and table.indexes:
-        raise NotImplementedError("Snowflake does not support indexes")
+        raise NotImplementedError("Only Snowflake Hybrid Tables supports indexes")
 
 
 dialect = SnowflakeDialect
