@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2012-2022 Snowflake Computing Inc. All rights reserved.
+# Copyright (c) 2012-2023 Snowflake Computing Inc. All rights reserved.
 #
 
 import sys
@@ -49,6 +49,7 @@ from .custom_types import (
     DOUBLE,
     FIXED,
     GEOGRAPHY,
+    GEOMETRY,
     NUMBER,
     OBJECT,
     STRING,
@@ -60,6 +61,17 @@ from .custom_types import (
     VARBINARY,
     VARIANT,
 )
+from .sql.custom_schema import DynamicTable, HybridTable
+from .sql.custom_schema.options import (
+    AsQueryOption,
+    IdentifierOption,
+    KeywordOption,
+    LiteralOption,
+    SnowflakeKeyword,
+    TableOptionKey,
+    TargetLagOption,
+    TimeUnit,
+)
 from .util import _url as URL
 
 base.dialect = dialect = snowdialect.dialect
@@ -67,6 +79,7 @@ base.dialect = dialect = snowdialect.dialect
 __version__ = importlib_metadata.version("snowflake-sqlalchemy-decube")
 
 __all__ = (
+    # Custom Types
     "BIGINT",
     "BINARY",
     "BOOLEAN",
@@ -90,6 +103,7 @@ __all__ = (
     "DOUBLE",
     "FIXED",
     "GEOGRAPHY",
+    "GEOMETRY",
     "OBJECT",
     "NUMBER",
     "STRING",
@@ -100,6 +114,7 @@ __all__ = (
     "TINYINT",
     "VARBINARY",
     "VARIANT",
+    # Custom Commands
     "MergeInto",
     "CSVFormatter",
     "JSONFormatter",
@@ -111,4 +126,17 @@ __all__ = (
     "ExternalStage",
     "CreateStage",
     "CreateFileFormat",
+    # Custom Tables
+    "HybridTable",
+    "DynamicTable",
+    # Custom Table Options
+    "AsQueryOption",
+    "TargetLagOption",
+    "LiteralOption",
+    "IdentifierOption",
+    "KeywordOption",
+    # Enums
+    "TimeUnit",
+    "TableOptionKey",
+    "SnowflakeKeyword",
 )
