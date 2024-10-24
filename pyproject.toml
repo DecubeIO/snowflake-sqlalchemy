@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "snowflake-sqlalchemy"
+name = "snowflake-sqlalchemy-decube"
 dynamic = ["version"]
 description = "Snowflake SQLAlchemy Dialect"
 readme = "README.md"
